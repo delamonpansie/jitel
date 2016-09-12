@@ -402,7 +402,7 @@ static void update_slot_data()
 
 	/* SBS-01V */
 	if (imot_ma > 0 && ubat_mv_filter > 0) {
-		sbus_slot(5, 0x8000 + 0 / 100);
+		sbus_slot(5, 0x8000 + 1000 * jive.pwmmot / 4096);
 		sbus_slot(6, (ubat_mv_filter + 50) / 100);
 	} else {
 		sbus_slot(5, 0x8000);
