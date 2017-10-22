@@ -394,18 +394,19 @@ static void update_slot_data()
 
 	/* Curr-1678 */
 	sbus_slot(1, 0x4000 + MIN(0x3fff, imot_ma / 10));
-	sbus_slot(2, ubat_mv / 10);
+	sbus_slot(2, (ubat_mv_filter + 50) / 100);
 	sbus_slot(3, sum_ma / 3600 / jive_row_per_second); /* mAh */
 
 	/* SBS-01RM */
 	sbus_slot(4, swap(mot_rpm / 6));
 
-	/* SBS-01V */
-	if (imot_ma > 0 && ubat_mv_filter > 0) {
-		sbus_slot(5, 0x8000 + 1000 * jive.pwmmot / 4096);
-		sbus_slot(6, (ubat_mv_filter + 50) / 100);
-	} else {
-		sbus_slot(5, 0x8000);
-		sbus_slot(6, 0);
-	}
+	/* Kontroik ESC */
+	sbus_slot(8, 0x8000 + ubat_mv / 10);
+	sbus_slot(9, sum_ma / 3600 / jive_row_per_second / 10);
+	sbus_slot(10, mot_rpm / 6);
+	sbus_slot(11, imot_ma / 10);
+	sbus_slot(12, 0); /* Temperature */
+	sbus_slot(13, 0); /* BEC Temperature */
+	sbus_slot(14, 0); /* BEC Current */
+	sbus_slot(15, (100 * (jive.pwmmot + 1)) / 4096);
 }
