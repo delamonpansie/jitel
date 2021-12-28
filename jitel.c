@@ -21,8 +21,9 @@ void usage_fault_handler(void) { while (1); }
 #include <assert.h>
 
 #define MIN(a, b) ({ typeof(a) __a = a, __b = b; __a < __b ? __a : __b; })
+#define MAX(a, b) ({ typeof(a) __a = a, __b = b; __a > __b ? __a : __b; })
 
-volatile unsigned int ticks;
+volatile unsigned int period;
 
 struct jive {
 	uint16_t magic1;
@@ -300,10 +301,23 @@ static void timer_init()
 	TIM3_EGR |= TIM_EGR_UG;
 }
 
+void sys_tick_handler(void)
+{
+	static unsigned ticks;
+	if (++ticks > 29) {
+		ticks = 0;
+		period = (period + 1) % 3;
+	}
+}
+
 int main()
 {
 	rcc_clock_setup_in_hse_8mhz_out_72mhz();
 	timer_init();
+
+	systick_set_frequency(10, rcc_ahb_frequency);
+	systick_interrupt_enable();
+	systick_counter_enable();
 
 	rcc_periph_clock_enable(RCC_GPIOC);
 	gpio_set(GPIOC, GPIO13);
@@ -328,6 +342,28 @@ static uint16_t swap(uint16_t a)
 	return (a << 8) | (a >> 8);
 }
 
+struct stats {
+	unsigned min, max, cnt;
+	unsigned long sum;
+};
+
+static void init_stat(struct stats *st, unsigned val)
+{
+	st->min = val;
+	st->max = val;
+	st->sum += val;
+	st->cnt = 1;
+}
+
+static void update_stat(struct stats *st, unsigned val)
+{
+	if (val < st->min)
+		st->min = val;
+	if (val > st->max)
+		st->max = val;
+	st->sum += val;
+	st->cnt++;
+}
 
 static void update_slot_data()
 {
@@ -339,18 +375,20 @@ static void update_slot_data()
 	unsigned ubat_mv = jive.ubat ? (jive.ubat + 1) * 100 : 0;
 	unsigned imot_ma = jive.imot && jive.pwmmot ? (jive.imot + 1) * 100 * jive.pwmmot / 4096 : 0;
 	unsigned mot_rpm = jive.rpm * 2; /* pyro-xxx */
+	unsigned mot_pwm = jive.pwmmot;
 
 	ubat_mv = ubat_mv * 1.012; /* adjust */
 
 	static unsigned sum_ma;
 	sum_ma += imot_ma;
 
-
-	static enum { INIT, SPOOLUP, DONE } state;
+	static enum { INIT, SPOOLUP, AIRBORNE, LANDED } state;
 	static unsigned tick;
-	static unsigned full_mv, ubat_mv_filter, load_ma;
+	static unsigned full_mv, ubat_mv_filter, ubat_mv_filter_saved, load_ma;
 	static unsigned prev_rpm;
 	static unsigned ri;
+
+	static struct stats imot_stat, ubat_stat, mot_rpm_stat, mot_pwm_stat;
 
 	switch (state) {
 	case INIT:
@@ -379,22 +417,67 @@ static void update_slot_data()
 
 			ri = 100000 * (full_mv - ubat_mv) / load_ma;
 			ri /= 2; /* magic */
-			state = DONE;
+			state = AIRBORNE;
+
+                        init_stat(&imot_stat, imot_ma);
+                        init_stat(&ubat_stat, ubat_mv);
+                        init_stat(&mot_rpm_stat, mot_rpm);
+                        init_stat(&mot_pwm_stat, mot_pwm);
 		}
 		break;
-	case DONE:
+	case AIRBORNE:
+		if (jive.throt < 80 || jive.throt > 4096) { /* Throttle < 20% */
+			state = LANDED;
+
+                        ubat_mv_filter_saved = ubat_mv_filter; /* shutup alarm after land */
+                        ubat_mv_filter = full_mv;
+			break;
+		}
+
+		update_stat(&imot_stat, imot_ma);
+		update_stat(&ubat_stat, ubat_mv);
+		update_stat(&mot_rpm_stat, mot_rpm);
+		update_stat(&mot_pwm_stat, mot_pwm);
+
+		if (imot_ma > 0) {
+			int adj_mv = ubat_mv + ri * imot_ma / 100000;
+			ubat_mv_filter = (ubat_mv_filter * 99 + adj_mv) / 100;
+		}
 		break;
-	}
+	case LANDED:
+		if (jive.throt > 80 && jive.throt < 4096) {
+			state = AIRBORNE;
 
+                        ubat_mv_filter = ubat_mv_filter_saved; /* restore value */
+			break;
+		}
 
-	if (imot_ma > 0) {
-		int adj_mv = ubat_mv + ri * imot_ma / 100000;
-		ubat_mv_filter = (ubat_mv_filter * 99 + adj_mv) / 100;
+		switch (period) {
+		case 0:
+			imot_ma = imot_stat.min;
+			ubat_mv = ubat_stat.min;
+			mot_rpm = mot_rpm_stat.min;
+			mot_pwm = mot_pwm_stat.min;
+			break;
+		case 1:
+			imot_ma = imot_stat.max;
+			ubat_mv = ubat_stat.max;
+			mot_rpm = mot_rpm_stat.max;
+			mot_pwm = mot_pwm_stat.max;
+			break;
+		case 2:
+			imot_ma = imot_stat.sum / MAX(imot_stat.cnt, 1);
+			ubat_mv = ubat_stat.sum / MAX(ubat_stat.cnt, 1);
+			mot_rpm = mot_rpm_stat.sum / MAX(mot_rpm_stat.cnt, 1);
+			mot_pwm = mot_pwm_stat.sum / MAX(mot_pwm_stat.cnt, 1);
+			break;
+		}
+		break;
 	}
 
 	/* Curr-1678 */
 	sbus_slot(1, 0x4000 + MIN(0x3fff, imot_ma / 10));
-	sbus_slot(2, (ubat_mv_filter + 50) / 100);
+	sbus_slot(2, (ubat_mv_filter + 50) / 10);
 	sbus_slot(3, sum_ma / 3600 / jive_row_per_second); /* mAh */
 
 	/* SBS-01RM */
@@ -408,5 +491,5 @@ static void update_slot_data()
 	sbus_slot(12, 0); /* Temperature */
 	sbus_slot(13, 0); /* BEC Temperature */
 	sbus_slot(14, 0); /* BEC Current */
-	sbus_slot(15, (100 * (jive.pwmmot + 1)) / 4096);
+	sbus_slot(15, (100 * (mot_pwm + 1)) / 4096);
 }
